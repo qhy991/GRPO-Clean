@@ -444,64 +444,120 @@ class DetailedInferenceCallback(TrainerCallback):
 
             logger.info(f"\n🔍 === 推理回调 (DetailedInferenceCallback) - 步数 {state.global_step} ===")
             
+            current_step_total_pass_ratio_sum = 0.0
+            current_step_samples_with_tests = 0
+            current_step_detailed_sim_results = []
+            generation_results_for_wandb_logging = [] # To store results for W&B table if needed
+
             if self.eval_dataset and len(self.eval_dataset) > 0:
                 sample_indices = random.sample(range(len(self.eval_dataset)), 
                                                min(self.num_samples, len(self.eval_dataset)))
                 
                 for i, idx in enumerate(sample_indices):
                     sample = self.eval_dataset[idx]
+                    prompt_from_dataset = str(sample['prompt']) # Ensure string
                     
-                    # 假设: sample['prompt'] 已经是 Qwen 格式化的
-                    # 这是因为 eval_dataset 应该是由主训练脚本的 full_dataset_processing_pipeline 处理过的
-                    prompt_from_dataset = sample['prompt'] 
-                    
-                    logger.info(f"\n📝 样本 {i+1}/{len(sample_indices)} (数据集索引: {idx})")
-                    
-                    # 调试日志：打印 prompt 的前缀，检查其格式
-                    logger.debug(f"DetailedInferenceCallback: Input prompt for model (first 150 chars): {str(prompt_from_dataset)[:150]}...")
+                    logger.info(f"\n📝 样本 {i+1}/{len(sample_indices)} (数据集索引: {idx}, Task ID: {sample.get('task_id', 'N/A')})")
+                    logger.debug(f"DetailedInferenceCallback: Input prompt for model (first 150 chars): {prompt_from_dataset[:150]}...")
 
-                    # 可选的格式检查和警告
-                    if isinstance(prompt_from_dataset, str) and not prompt_from_dataset.strip().endswith("<|im_start|>assistant\n"):
-                        logger.warning(
-                            f"DetailedInferenceCallback: Prompt from eval_dataset (idx {idx}) "
-                            f"does NOT look Qwen-formatted. Using as-is. Prompt preview: {prompt_from_dataset[:100]}..."
-                        )
-                    elif not isinstance(prompt_from_dataset, str):
-                         logger.warning(
-                            f"DetailedInferenceCallback: Prompt from eval_dataset (idx {idx}) is not a string (type: {type(prompt_from_dataset)}). "
-                            f"Will be cast to string."
-                        )
-                         prompt_from_dataset = str(prompt_from_dataset) # 确保是字符串
-
-                    # 获取原始问题描述，用于日志记录
-                    # 优先使用 original_prompt_for_debug，其次是 original_enhanced_prompt
-                    orig_prompt_for_log = sample.get('original_prompt_for_debug', 'N/A')
-                    if orig_prompt_for_log == 'N/A':
-                        orig_prompt_for_log = sample.get('original_enhanced_prompt', 'N/A')
-
+                    orig_prompt_for_log = sample.get('original_prompt_for_debug', sample.get('original_enhanced_prompt', 'N/A'))
                     logger.info(f"原始问题 (用于日志): {orig_prompt_for_log[:100]}...")
-                    logger.info(f"等级: {sample.get('level', 'unknown')}")
-                    logger.info(f"复杂度: {sample.get('complexity_score', 'unknown')}")
+                    logger.info(f"等级: {sample.get('level', 'unknown')}, 复杂度: {sample.get('complexity_score', 'unknown')}")
                     
                     try:
-                        # 传递已经是Qwen格式化的 prompt_from_dataset 给 _generate_single_sample
                         generated_result = self._generate_single_sample(model, prompt_from_dataset, state.global_step)
                         
-                        if self.output_dir:
-                            self._save_generation_sample(state.global_step, i, sample, generated_result)
-                        
                         quality_metrics = assess_code_quality(generated_result.get('code', ''))
+                        logger.info(f"生成时间: {generated_result.get('generation_time', 0):.2f}秒, 代码质量: {quality_metrics}")
                         
-                        logger.info(f"生成时间: {generated_result.get('generation_time', 0):.2f}秒")
-                        logger.info(f"代码质量: {quality_metrics}")
+                        current_sample_wandb_log = {
+                            "step": state.global_step, "sample_idx": idx, "task_id": sample.get('task_id', 'N/A'),
+                            "level": sample.get('level'), "complexity": sample.get('complexity_score'),
+                            "reasoning_preview": generated_result.get('reasoning', '')[:100],
+                            "code_preview": generated_result.get('code', '')[:100],
+                            **quality_metrics
+                        }
+
+                        code_to_test = generated_result.get('code')
+                        tb_path = sample.get('testbench_path')
+                        expected_tests = sample.get('expected_total_tests')
+                        prompt_identifier_for_sim = f"Step{state.global_step}_Sample{idx}_{sample.get('task_id', 'UnknownTask')}"
                         
-                        if sample.get('testbench_path') and generated_result.get('code'):
-                            test_result = self._run_quick_test(generated_result['code'], sample)
-                            logger.info(f"功能测试: {test_result}")
+                        current_sample_sim_result = None
+                        if code_to_test and code_to_test.strip() and tb_path and os.path.exists(tb_path):
+                            logger.info(f"DetailedInferenceCallback: Running simulation for sample {idx} (Task: {sample.get('task_id', 'N/A')})")
+                            current_sample_sim_result = run_iverilog_simulation(
+                                generated_verilog_code=code_to_test,
+                                testbench_file_path=tb_path,
+                                expected_total_tests_from_manifest=expected_tests,
+                                prompt_identifier=prompt_identifier_for_sim,
+                                completion_idx=i,
+                                print_simulation_details=False
+                            )
+                            # current_step_detailed_sim_results.append(current_sample_sim_result) # Appending to this list if used for batch summary later
+
+                            logger.info(f"DetailedInferenceCallback: Sample {idx} (Task: {sample.get('task_id', 'N/A')}) "
+                                        f"Sim results - Passed: {current_sample_sim_result.get('passed_tests',0)}/{current_sample_sim_result.get('total_tests_in_output',0)}. "
+                                        f"Compilation: {current_sample_sim_result.get('compilation_success', False)}, "
+                                        f"SimRun: {current_sample_sim_result.get('simulation_run_success', False)}, "
+                                        f"ParseSuccess: {current_sample_sim_result.get('parsing_success', False)}")
+
+                            if current_sample_sim_result.get("compilation_success") and \
+                               current_sample_sim_result.get("simulation_run_success") and \
+                               current_sample_sim_result.get("parsing_success") and \
+                               current_sample_sim_result.get("total_tests_in_output", 0) > 0:
+
+                                pass_ratio = current_sample_sim_result["passed_tests"] / current_sample_sim_result["total_tests_in_output"]
+                                current_step_total_pass_ratio_sum += pass_ratio
+                                current_step_samples_with_tests += 1
+                                current_sample_wandb_log['pass_ratio'] = pass_ratio
+                                current_sample_wandb_log['sim_passed'] = current_sample_sim_result["passed_tests"]
+                                current_sample_wandb_log['sim_total'] = current_sample_sim_result["total_tests_in_output"]
+                            else:
+                                current_sample_wandb_log['pass_ratio'] = 0.0
+                                current_sample_wandb_log['sim_passed'] = current_sample_sim_result.get('passed_tests',0)
+                                current_sample_wandb_log['sim_total'] = current_sample_sim_result.get('total_tests_in_output',0)
+                                logger.info(f"DetailedInferenceCallback: Sample {idx} did not contribute to avg_pass_rate due to sim issues.")
+                        else:
+                            current_sample_wandb_log['pass_ratio'] = 0.0
+                            current_sample_wandb_log['sim_passed'] = 0
+                            current_sample_wandb_log['sim_total'] = 0
+                            if not code_to_test or not code_to_test.strip():
+                                logger.info(f"DetailedInferenceCallback: No code generated or code is empty for sample {idx}. Skipping simulation.")
+                            if not tb_path or not os.path.exists(tb_path):
+                                logger.info(f"DetailedInferenceCallback: Testbench path invalid or not found for sample {idx} ('{tb_path}'). Skipping simulation.")
+
+                        generation_results_for_wandb_logging.append(current_sample_wandb_log)
+
+                        # current_step_detailed_sim_results is populated inside the if block,
+                        # so it might not have an entry for every 'i' if a sim wasn't run.
+                        # Pass current_sample_sim_result directly.
+                        if self.output_dir:
+                            self._save_generation_sample(state.global_step, i, sample, generated_result, simulation_result=current_sample_sim_result)
                             
                     except Exception as e:
-                        logger.error(f"生成或处理样本 {idx} 失败: {e}", exc_info=True) # 添加 exc_info=True
+                        logger.error(f"生成或处理样本 {idx} 失败: {e}", exc_info=True)
+
+            avg_test_pass_rate_current_step = current_step_total_pass_ratio_sum / current_step_samples_with_tests if current_step_samples_with_tests > 0 else 0.0
             
+            if hasattr(wandb, 'run') and wandb.run is not None:
+                log_data_wandb = {
+                    "eval_avg_test_pass_rate": avg_test_pass_rate_current_step,
+                    "eval_current_step_samples_with_tests": current_step_samples_with_tests,
+                    "eval_current_step_total_pass_ratio_sum": current_step_total_pass_ratio_sum,
+                    # Any other metrics from the original callback can be added here
+                }
+                # Optionally log table of generation results
+                # try:
+                #     wandb_table = wandb.Table(dataframe=pd.DataFrame(generation_results_for_wandb_logging))
+                #     log_data_wandb["detailed_inference_samples"] = wandb_table
+                # except Exception as e_table:
+                #    logger.warning(f"Failed to create W&B Table for detailed inference: {e_table}")
+
+                wandb.log(log_data_wandb, step=state.global_step)
+                logger.info(f"DetailedInferenceCallback: Logged to W&B at step {state.global_step}: AvgPassRate={avg_test_pass_rate_current_step:.4f}, SamplesWithTests={current_step_samples_with_tests}")
+
+
             logger.info(f"🔍 === 推理回调 (DetailedInferenceCallback) 结束 ===\n")
             
     def _generate_single_sample(self, model, prompt, step):
@@ -547,13 +603,74 @@ class DetailedInferenceCallback(TrainerCallback):
             'code': code,
             'raw_output': generated_text,
             'generation_time': generation_time,
-            'step': step
+            'step': step,
+            'model_input_prompt': prompt
         }
     
-    def _save_generation_sample(self, step, sample_idx, original_sample, generated_result):
-        """保存生成样本到文件，包含模型实际输入"""
+    def _save_generation_sample(self, step, sample_idx, original_sample, generated_result, simulation_result: Optional[Dict[str, Any]] = None):
+        """保存生成样本到文件，包含模型实际输入和仿真结果"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 从 original_sample 中提取 task_id 或其他唯一标识符（如果存在）
+        task_id_slug = str(original_sample.get('task_id', f"sample_{sample_idx}")).replace('/', '_')
+
+        filename = f"step_{step}_{task_id_slug}_{timestamp}.json"
+        filepath = os.path.join(self.samples_dir, filename)
+
+        orig_prompt_for_log = original_sample.get('original_prompt_for_debug', original_sample.get('original_enhanced_prompt', 'N/A'))
+
+        sample_data_to_save = {
+            "step": step,
+            "timestamp_iso": datetime.now().isoformat(),
+            "dataset_original_sample_info": {
+                "level": original_sample.get('level'),
+                "complexity_score": original_sample.get('complexity_score'),
+                "original_problem_desc_for_debug": orig_prompt_for_log[:300],
+                "testbench_path": original_sample.get('testbench_path', ''),
+                "task_id": original_sample.get('task_id')
+            },
+            "model_input_prompt_preview": generated_result.get('model_input_prompt', '')[:300] + "...",
+            "generated_result": {
+                'reasoning': generated_result.get('reasoning'),
+                'code': generated_result.get('code'),
+                'raw_output_preview': generated_result.get('raw_output', '')[:300] + "...",
+                'generation_time_seconds': generated_result.get('generation_time')
+            },
+            "simulation_details": simulation_result if simulation_result else "Not run or not applicable" # New key
+        }
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(sample_data_to_save, f, indent=2, ensure_ascii=False)
+            logger.debug(f"Saved generation sample to {filepath}")
+        except Exception as e_save:
+            logger.error(f"Failed to save generation sample to {filepath}: {e_save}", exc_info=True)
+
+    # def _run_quick_test(self, code, sample):
+    #     """快速功能测试 - This method might be redundant now with direct simulation."""
+    #     try:
+    #         if not code or not code.strip():
+    #             return {"status": "empty_code"}
+
+    #         # 简单的语法检查
+    #         if 'module' not in code.lower():
+    #             return {"status": "no_module"}
+
+    #         if 'endmodule' not in code.lower():
+    #             return {"status": "no_endmodule"}
+
+    #         # 如果有testbench，可以尝试快速仿真
+    #         testbench_path = sample.get('testbench_path', '')
+    #         if os.path.exists(testbench_path):
+    #             # This part is now handled directly in on_step_end
+    #             # sim_result = run_iverilog_simulation(...) # Example
+    #             return {"status": "testbench_available", "path": testbench_path, "note": "Full sim run in on_step_end"}
+
+    #         return {"status": "basic_syntax_ok"}
+
+    #     except Exception as e:
+    #         return {"status": "error", "message": str(e)}
+
+def parse_llm_completion(completion_text: str, debug_prompt: Optional[str] = None,
+                        debug_context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str]]:
         task_id_slug = str(original_sample.get('task_id', f"sample_{sample_idx}")).replace('/', '_')
         
         filename = f"step_{step}_{task_id_slug}_{timestamp}.json"
@@ -594,30 +711,30 @@ class DetailedInferenceCallback(TrainerCallback):
         except Exception as e_save:
             logger.error(f"Failed to save generation sample to {filepath}: {e_save}", exc_info=True)
     
-    def _run_quick_test(self, code, sample):
-        """快速功能测试"""
-        try:
-            if not code or not code.strip():
-                return {"status": "empty_code"}
+    # def _run_quick_test(self, code, sample):
+    #     """快速功能测试 - This method might be redundant now with direct simulation."""
+    #     try:
+    #         if not code or not code.strip():
+    #             return {"status": "empty_code"}
             
-            # 简单的语法检查
-            if 'module' not in code.lower():
-                return {"status": "no_module"}
+    #         # 简单的语法检查
+    #         if 'module' not in code.lower():
+    #             return {"status": "no_module"}
             
-            if 'endmodule' not in code.lower():
-                return {"status": "no_endmodule"}
+    #         if 'endmodule' not in code.lower():
+    #             return {"status": "no_endmodule"}
             
-            # 如果有testbench，可以尝试快速仿真
-            testbench_path = sample.get('testbench_path', '')
-            if os.path.exists(testbench_path):
-                # 这里可以调用 run_iverilog_simulation 进行快速测试
-                # 为了节省时间，可以设置较短的超时时间
-                return {"status": "testbench_available", "path": testbench_path}
+    #         # 如果有testbench，可以尝试快速仿真
+    #         testbench_path = sample.get('testbench_path', '')
+    #         if os.path.exists(testbench_path):
+    #             # This part is now handled directly in on_step_end
+    #             # sim_result = run_iverilog_simulation(...) # Example
+    #             return {"status": "testbench_available", "path": testbench_path, "note": "Full sim run in on_step_end"}
             
-            return {"status": "basic_syntax_ok"}
+    #         return {"status": "basic_syntax_ok"}
             
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+    #     except Exception as e:
+    #         return {"status": "error", "message": str(e)}
 
 def parse_llm_completion(completion_text: str, debug_prompt: Optional[str] = None, 
                         debug_context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str]]:

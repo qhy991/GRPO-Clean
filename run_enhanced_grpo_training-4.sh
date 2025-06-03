@@ -27,6 +27,7 @@ STAGE1_ADAPTER_PATH="/home/qhy/Research/GRPO-RV/GRPO-v2/S1/trainer_output/traine
 # 🔥 重要：使用处理后的增强数据集
 # 根据你的数据集处理方式选择一个：
 DATASET_PATH="../dataset/all.jsonl"
+DATASET_BASE_PATH=$(dirname "${DATASET_PATH}")
 
 # --- RESUME FROM CHECKPOINT CONFIGURATION ---
 # 🔄 设置此变量为你想要从中恢复的 checkpoint 目录的路径
@@ -87,15 +88,15 @@ GEN_LENGTH_PENALTY=1.0
 # --- Enhanced Multi-Objective Reward Configuration ---
 # Basic compilation rewards (enhanced)
 REWARD_COMPILATION_SUCCESS=2.0
-REWARD_COMPILATION_FAILURE=-8.0
+REWARD_COMPILATION_FAILURE=-4.0
 REWARD_SIMULATION_CRASH=-4.0
 REWARD_OUTPUT_PARSE_ERROR=-2.0
-REWARD_MISSING_CODE_BLOCK_PENALTY=-6.0
+REWARD_MISSING_CODE_BLOCK_PENALTY=-3.0
 REWARD_TIMEOUT_PENALTY=-3.0
 
 # Enhanced functional rewards (non-linear)
 REWARD_TEST_PASS_BASE=1.5
-REWARD_TEST_PASS_BONUS_MULTIPLIER=1.3
+REWARD_TEST_PASS_BONUS_MULTIPLIER=1.2
 REWARD_MAX_FUNCTIONAL=15.0
 REWARD_ALL_TESTS_PASSED_BONUS=5.0
 
@@ -108,13 +109,13 @@ REWARD_SYNTHESIS_FRIENDLY_BONUS=1.0
 REWARD_RESOURCE_USAGE_PENALTY=-0.5
 
 # Multi-objective weights
-REWARD_FUNCTIONAL_WEIGHT=0.6
-REWARD_EFFICIENCY_WEIGHT=0.2
+REWARD_FUNCTIONAL_WEIGHT=0.7
+REWARD_EFFICIENCY_WEIGHT=0.15
 REWARD_READABILITY_WEIGHT=0.1
-REWARD_ROBUSTNESS_WEIGHT=0.1
+REWARD_ROBUSTNESS_WEIGHT=0.05
 
 # Adaptive reward scaling
-REWARD_ENABLE_ADAPTIVE_SCALING=true
+REWARD_ENABLE_ADAPTIVE_SCALING=false
 REWARD_SCALE_FACTOR=1.0
 REWARD_CLIPPING_RANGE=20.0
 
@@ -124,7 +125,7 @@ CURRICULUM_TYPE="dual_layer"
 
 # 🎯 根据你的数据集分布调整这些设置
 # 运行数据集处理脚本后，它会给出推荐配置，复制到这里
-CURRICULUM_FOCUS_LEVELS="advanced basic intermediate"
+CURRICULUM_FOCUS_LEVELS="basic intermediate advanced"
 CURRICULUM_COMPLEXITY_EMPHASIS="balanced"  # 选项: "simple", "balanced", "complex"
 
 # 如果你的数据集主要是基础级别，使用:
@@ -141,9 +142,9 @@ EXPERIENCE_BUFFER_SIZE=1000
 REPLAY_SAMPLE_RATIO=0.2
 
 # --- Enhanced Training Configuration ---
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=16
-LEARNING_RATE=3e-6               # More conservative
+PER_DEVICE_TRAIN_BATCH_SIZE=2
+GRADIENT_ACCUMULATION_STEPS=8
+LEARNING_RATE=5e-5               # More conservative
 NUM_TRAIN_EPOCHS=4
 MAX_STEPS=-1
 WARMUP_RATIO=0.15                # Increased warmup
@@ -300,6 +301,7 @@ CMD_ARGS="${CMD_ARGS} --wandb_run_name_prefix \"enhanced-v3-${MODEL_NAME_SLUG}\"
 CMD_ARGS="${CMD_ARGS} --model_name_or_path \"${BASE_MODEL_NAME_OR_PATH}\""
 CMD_ARGS="${CMD_ARGS} --stage1_adapter_path \"${STAGE1_ADAPTER_PATH}\""
 CMD_ARGS="${CMD_ARGS} --dataset_path \"${DATASET_PATH}\""
+CMD_ARGS="${CMD_ARGS} --dataset_base_path "${DATASET_BASE_PATH}""
 CMD_ARGS="${CMD_ARGS} --output_dir_base \"${OUTPUT_DIR_BASE}\""
 CMD_ARGS="${CMD_ARGS} --lora_rank ${LORA_RANK}"
 CMD_ARGS="${CMD_ARGS} --lora_alpha ${LORA_ALPHA}"

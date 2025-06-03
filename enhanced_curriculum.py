@@ -185,34 +185,86 @@ class EnhancedCurriculumManager:
         return stage_dataset
     
     def should_advance_stage(self, recent_performance: float) -> bool:
-        """判断是否应该进入下一阶段"""
+        """判断是否应该进入下一阶段.
+
+        Args:
+            recent_performance: The latest performance metric (e.g., avg_test_pass_rate).
+        """
         if self.current_stage >= len(self.curriculum_stages) - 1:
+            logger.debug(f"Already at the final stage ({self.current_stage}). Cannot advance further.")
             return False
         
         stage = self.curriculum_stages[self.current_stage]
-        self.stage_performance_history.append(recent_performance)
+        self.stage_performance_history.append(recent_performance) # Add current performance to history for this stage
         
-        # 需要足够的评估次数
+        logger.debug(f"Stage {self.current_stage} ('{stage.name}'): Received performance {recent_performance:.4f}. "
+                    f"History size: {len(self.stage_performance_history)}. Min evals required: {stage.min_evaluations}.")
+
+        # Check if minimum number of evaluations for this stage has been met
         if len(self.stage_performance_history) < stage.min_evaluations:
-            logger.debug(f"Stage {self.current_stage}: Need more evaluations "
-                        f"({len(self.stage_performance_history)}/{stage.min_evaluations})")
+            logger.info(f"Stage {self.current_stage} ('{stage.name}'): Not enough evaluations yet. "
+                        f"Have {len(self.stage_performance_history)}, need {stage.min_evaluations}.")
             return False
         
-        # 检查最近的性能表现
-        recent_window = min(3, len(self.stage_performance_history))
-        recent_avg = np.mean(self.stage_performance_history[-recent_window:])
+        # If enough evaluations, consider the average of recent performance scores
+        # Using all recorded performances for this stage for the average, or a sliding window if preferred.
+        # For simplicity here, let's use all available history for the current stage.
+        # A more sophisticated approach might use a decaying average or only the last N evaluations *after* min_evaluations is met.
+
+        # Let's use the performance scores collected *after* min_evaluations were met, or just the most recent ones
+        # if that's simpler. The current logic uses a window of the last 3, which is fine.
+
+        # Consider the average of the performance history for this stage (or a recent window of it)
+        # The history is reset when a stage advances.
+        # Let's use the average of all recorded performances for the current stage
+        # if len(self.stage_performance_history) >= stage.min_evaluations:
+        # The previous logic of using a recent window seems fine.
+
+        # Let's take the average of the performance metrics collected for this stage,
+        # but only those collected *after* meeting the min_evaluations count, or a fixed window.
+        # The existing logic takes min(3, len(history)) which means if min_evaluations is 5, it will
+        # average the last 3 of those 5 (or more). This seems reasonable.
+
+        recent_window_size = min(len(self.stage_performance_history), max(3, stage.min_evaluations)) # Ensure window is at least min_evals if history is long enough, or all history if shorter
+        # Or, more simply, average all performances recorded for this stage so far, if count >= min_evaluations
+        # Let's stick to a simpler interpretation: average of the last `stage.min_evaluations` (or all if fewer than that many *additional* evals)
         
-        should_advance = recent_avg >= stage.performance_threshold
+        # The previous logic: "recent_window = min(3, len(self.stage_performance_history))"
+        # This means it only looks at the last 3 evaluations *once min_evaluations condition is met*.
+        # This is a common way to do it to ensure sustained performance.
+
+        # Let's refine: average performance of the window that satisfies min_evaluations.
+        # If min_evaluations is 10, we should average at least 10 evaluations.
+        # The current history already includes the `recent_performance`.
+
+        # We need to ensure we are looking at a stable performance, so averaging the last few
+        # (e.g. 3, or up to `min_evaluations`) makes sense.
+
+        # Let's use the average of the last `stage.min_evaluations` scores if available,
+        # otherwise all scores if fewer than `stage.min_evaluations` have been recorded (but this case is handled by the check above).
+        # If more than `stage.min_evaluations` are present, average the most recent `stage.min_evaluations` ones.
+        num_scores_to_average = stage.min_evaluations
+
+        # Ensure we only average available scores if history is shorter than num_scores_to_average (but longer than initial check)
+        # This part is actually covered by `len(self.stage_performance_history) < stage.min_evaluations` check.
+        # So, if we are here, len(self.stage_performance_history) >= stage.min_evaluations.
+
+        # Average the most recent 'num_scores_to_average' performance scores.
+        relevant_performances = self.stage_performance_history[-num_scores_to_average:]
+        current_average_performance = np.mean(relevant_performances)
+
+        logger.info(f"Stage {self.current_stage} ('{stage.name}'): Avg performance over last {len(relevant_performances)} evals: {current_average_performance:.4f}. "
+                    f"Threshold: {stage.performance_threshold:.4f}.")
+
+        should_advance = current_average_performance >= stage.performance_threshold
         
         if should_advance:
-            logger.info(f"Stage {self.current_stage} performance criteria met: "
-                       f"recent avg = {recent_avg:.3f} >= threshold = {stage.performance_threshold}")
+            logger.info(f"Stage {self.current_stage} ('{stage.name}') performance criteria MET. Advancing.")
         else:
-            logger.debug(f"Stage {self.current_stage} performance not ready: "
-                        f"recent avg = {recent_avg:.3f} < threshold = {stage.performance_threshold}")
-        
+            logger.info(f"Stage {self.current_stage} ('{stage.name}') performance criteria NOT YET MET.")
+
         return should_advance
-    
+
     def advance_stage(self) -> bool:
         """进入下一阶段"""
         if self.current_stage < len(self.curriculum_stages) - 1:
@@ -324,7 +376,7 @@ def create_default_curriculum_stages() -> List[CurriculumStageConfig]:
             complexity_range=(0.0, 3.0),
             epochs_ratio=0.25,
             performance_threshold=0.7,
-            min_evaluations=5,
+            min_evaluations=10, # Changed
             description="基础阶段：学习简单的基础级设计"
         ),
         CurriculumStageConfig(
@@ -333,7 +385,7 @@ def create_default_curriculum_stages() -> List[CurriculumStageConfig]:
             complexity_range=(0.0, 5.0),
             epochs_ratio=0.25,
             performance_threshold=0.65,
-            min_evaluations=5,
+            min_evaluations=10, # Changed
             description="初级阶段：基础级+简单中级设计"
         ),
         CurriculumStageConfig(
@@ -342,7 +394,7 @@ def create_default_curriculum_stages() -> List[CurriculumStageConfig]:
             complexity_range=(3.0, 7.0),
             epochs_ratio=0.25,
             performance_threshold=0.6,
-            min_evaluations=4,
+            min_evaluations=10, # Changed
             description="中级阶段：中等复杂度的中级设计"
         ),
         CurriculumStageConfig(
@@ -351,7 +403,7 @@ def create_default_curriculum_stages() -> List[CurriculumStageConfig]:
             complexity_range=(5.0, 9.0),
             epochs_ratio=0.15,
             performance_threshold=0.55,
-            min_evaluations=4,
+            min_evaluations=10, # Changed
             description="高级阶段：复杂的中级和高级设计"
         ),
         CurriculumStageConfig(
@@ -360,7 +412,7 @@ def create_default_curriculum_stages() -> List[CurriculumStageConfig]:
             complexity_range=(7.0, 10.0),
             epochs_ratio=0.1,
             performance_threshold=0.5,
-            min_evaluations=3,
+            min_evaluations=10, # Changed
             description="专家阶段：最复杂的高级和专家级设计"
         )
     ]
@@ -393,8 +445,9 @@ def create_custom_curriculum_stages(
             name="foundation",
             dataset_levels=["basic"],
             complexity_range=complexity_ranges[0],
-            epochs_ratio=0.3,
+            epochs_ratio=0.3, # Will be normalized later
             performance_threshold=0.7,
+            min_evaluations=10, # Added
             description="基础阶段：最简单的基础级设计"
         ))
     
@@ -404,8 +457,9 @@ def create_custom_curriculum_stages(
             name="elementary",
             dataset_levels=["basic", "intermediate"],
             complexity_range=complexity_ranges[1],
-            epochs_ratio=0.25,
+            epochs_ratio=0.25, # Will be normalized
             performance_threshold=0.65,
+            min_evaluations=10, # Added
             description="初级阶段：基础到中级的过渡"
         ))
     
@@ -415,8 +469,9 @@ def create_custom_curriculum_stages(
             name="intermediate",
             dataset_levels=["intermediate"],
             complexity_range=complexity_ranges[2],
-            epochs_ratio=0.25,
+            epochs_ratio=0.25, # Will be normalized
             performance_threshold=0.6,
+            min_evaluations=10, # Added
             description="中级阶段：中等复杂度设计"
         ))
     
@@ -426,8 +481,9 @@ def create_custom_curriculum_stages(
             name="advanced",
             dataset_levels=["intermediate", "advanced"],
             complexity_range=complexity_ranges[3],
-            epochs_ratio=0.15,
+            epochs_ratio=0.15, # Will be normalized
             performance_threshold=0.55,
+            min_evaluations=10, # Added
             description="高级阶段：复杂设计"
         ))
     
@@ -437,11 +493,24 @@ def create_custom_curriculum_stages(
             name="expert",
             dataset_levels=["advanced", "expert"],
             complexity_range=complexity_ranges[4],
-            epochs_ratio=0.05,
+            epochs_ratio=0.05, # Will be normalized
             performance_threshold=0.5,
+            min_evaluations=10, # Added
             description="专家阶段：最复杂设计"
         ))
     
+    if not stages: # Ensure at least one stage if focus_levels is empty or misconfigured
+        logger.warning("No custom stages generated based on focus_levels. Falling back to a single default stage.")
+        stages.append(CurriculumStageConfig(
+            name="default_full_range",
+            dataset_levels=focus_levels if focus_levels else ["basic", "intermediate", "advanced", "expert"],
+            complexity_range=(0.0, 10.0),
+            epochs_ratio=1.0,
+            performance_threshold=0.6, # Default threshold
+            min_evaluations=10,        # Default min_evaluations
+            description="Default stage covering all specified levels and full complexity range."
+        ))
+
     # 标准化epoch比例
     total_ratio = sum(stage.epochs_ratio for stage in stages)
     for stage in stages:

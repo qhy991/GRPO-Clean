@@ -116,56 +116,7 @@ class ScriptConfig:
     )
     
     # Dual-layer curriculum stages (more fine-grained control)
-    curriculum_stages: List[Dict[str, Any]] = field(
-        default_factory=lambda: [
-            {
-                "name": "foundation",
-                "dataset_levels": ["basic"],
-                "complexity_range": [0.0, 3.0],
-                "epochs_ratio": 0.25,
-                "performance_threshold": 0.4,
-                "min_evaluations": 3,
-                "description": "基础阶段：学习简单的基础级设计"
-            },
-            {
-                "name": "elementary", 
-                "dataset_levels": ["basic", "intermediate"],
-                "complexity_range": [0.0, 5.0],
-                "epochs_ratio": 0.25,
-                "performance_threshold": 0.45,
-                "min_evaluations": 3,
-                "description": "初级阶段：基础级+简单中级设计"
-            },
-            {
-                "name": "intermediate",
-                "dataset_levels": ["intermediate"],
-                "complexity_range": [3.0, 7.0], 
-                "epochs_ratio": 0.25,
-                "performance_threshold": 0.6,
-                "min_evaluations": 4,
-                "description": "中级阶段：中等复杂度的中级设计"
-            },
-            {
-                "name": "advanced",
-                "dataset_levels": ["intermediate", "advanced"],
-                "complexity_range": [5.0, 9.0],
-                "epochs_ratio": 0.15,
-                "performance_threshold": 0.55,
-                "min_evaluations": 4,
-                "description": "高级阶段：复杂的中级和高级设计"
-            },
-            {
-                "name": "expert",
-                "dataset_levels": ["advanced", "expert"],
-                "complexity_range": [7.0, 10.0],
-                "epochs_ratio": 0.1,
-                "performance_threshold": 0.5,
-                "min_evaluations": 3,
-                "description": "专家阶段：最复杂的高级和专家级设计"
-            }
-        ],
-        metadata={"help": "Detailed dual-layer curriculum stages configuration."}
-    )
+    curriculum_stages: List[Dict[str, Any]] = field(metadata={"help": "Detailed dual-layer curriculum stages configuration."})
     
     # Experience replay config
     enable_experience_replay: bool = field(default=True, metadata={"help": "Enable experience replay buffer."})
@@ -243,7 +194,7 @@ class EnhancedRewardConfig:
         
         if self.enable_adaptive_scaling and training_step > 0:
             # Gradually increase reward sensitivity as training progresses
-            adaptive_factor = min(1.0 + (training_step / 1000) * 0.1, 1.5)
+            adaptive_factor = min(1.0 + (training_step / 5000) * 0.1, 1.5)
             scaled_reward *= adaptive_factor
         
         # Clip to prevent instability

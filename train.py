@@ -101,6 +101,7 @@ class DetailedWandbCallback(TrainerCallback):
         self.reward_cfg = reward_cfg
         self.experience_buffer = experience_buffer
         self.step_count = 0
+        self.recent_rewards = deque(maxlen=100) # Added
         
     def on_init_end(self, args, state, control, **kwargs):
         if not getattr(self.env_cfg, 'wandb_disable', False):
@@ -145,27 +146,43 @@ class DetailedWandbCallback(TrainerCallback):
             # 记录到W&B
             if wandb_logs:
                 wandb.log(wandb_logs, step=current_step)
+
+            if self.recent_rewards:
+                try:
+                    wandb.log({"reward_distribution": wandb.Histogram(np.array(self.recent_rewards))}, step=current_step)
+                    # Optional: Clear recent_rewards after logging histogram if it's preferred to log distribution of rewards *since last log*
+                    # self.recent_rewards.clear()
+                except Exception as e_hist:
+                    logger.warning(f"Failed to log reward histogram to W&B: {e_hist}")
                 
         except Exception as e_wandb:
             logger.warning(f"W&B 日志记录失败: {e_wandb}")
 
+    def add_reward(self, reward: float):
+        if getattr(self.env_cfg, 'wandb_disable', False) or (hasattr(wandb, 'run') and wandb.run is None):
+            return
+        self.recent_rewards.append(reward)
+
     def log_reward_components(self, reward_components: Dict[str, float]):
         """Log detailed reward component breakdown."""
         try:
-            import wandb
-            if wandb.run is not None:
+            # import wandb # Already imported if needed
+            if hasattr(wandb, 'run') and wandb.run is not None and not getattr(self.env_cfg, 'wandb_disable', False):
                 wandb.log({f"reward_components/{k}": v for k, v in reward_components.items()})
         except Exception as e:
             logger.warning(f"Failed to log reward components: {e}")
 
-    def log_reward(self, reward: float):
-        """Log individual reward values."""
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({"reward": reward})
-        except Exception as e:
-            logger.warning(f"Failed to log reward: {e}")
+    # log_reward method is now effectively replaced by add_reward for histogram purposes.
+    # If individual reward logging per completion by this callback is still desired (outside GRPOTrainer's own logging),
+    # it would need a different name or logic. For now, assuming add_reward covers the primary need.
+    # def log_reward(self, reward: float):
+    #     """Log individual reward values."""
+    #     try:
+    #         # import wandb
+    #         if hasattr(wandb, 'run') and wandb.run is not None:
+    #             wandb.log({"reward": reward}) # This might be redundant if GRPOTrainer logs rewards
+    #     except Exception as e:
+    #         logger.warning(f"Failed to log reward: {e}")
 
     def log_batch_aggregated_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None):
         """Logs batch-aggregated metrics (unscaled rewards, funnel stats) to W&B."""
@@ -309,53 +326,66 @@ def setup_curriculum_manager(script_cfg: ScriptConfig, dataset: Dataset) -> Opti
     has_level_info = False
     if len(dataset) > 0:
         first_example = dataset[0]
-        has_level_info = 'level' in first_example and first_example['level'] is not None
+        # Ensure 'level' exists and is not None. Also handle cases where it might be an empty string.
+        has_level_info = 'level' in first_example and first_example['level'] is not None and str(first_example['level']).strip() != ""
     
     if not has_level_info:
-        logger.warning("Dataset does not contain 'level' field. Curriculum learning will use complexity-only mode.")
-        script_cfg.curriculum_type = "complexity_only" 
+        logger.warning("Dataset does not contain valid 'level' field data. Curriculum learning will use complexity-only or default stages.")
+        # Avoid forcing complexity_only if user explicitly set another type, let it fall to default.
+        if script_cfg.curriculum_type == "dual_layer" or script_cfg.curriculum_type == "level_only":
+            logger.info(f"Switching curriculum type from '{script_cfg.curriculum_type}' to 'complexity_only' due to missing level info.")
+            script_cfg.curriculum_type = "complexity_only"
     
     curriculum_stages_config_list = []
-    if script_cfg.curriculum_type == "dual_layer" and has_level_info:
-        if isinstance(script_cfg.curriculum_stages, list):
-            for stage_dict in script_cfg.curriculum_stages:
-                if isinstance(stage_dict, dict): 
-                    stage_config = CurriculumStageConfig(
-                        name=stage_dict.get("name", "Unnamed Stage"),
-                        dataset_levels=stage_dict.get("dataset_levels", []),
-                        complexity_range=tuple(stage_dict.get("complexity_range", (0,10))),
-                        epochs_ratio=stage_dict.get("epochs_ratio", 0.1),
-                        performance_threshold=stage_dict.get("performance_threshold", 0.6),
-                        min_evaluations=stage_dict.get("min_evaluations", 5),
-                        description=stage_dict.get("description", "")
-                    )
-                    curriculum_stages_config_list.append(stage_config)
-                else:
-                    logger.warning(f"Skipping invalid curriculum stage definition: {stage_dict}")
-            logger.info("🎯 Dual-layer curriculum learning enabled with dataset levels + complexity")
-        else:
-            logger.error("script_cfg.curriculum_stages is not a list for dual_layer. Falling back.")
-            script_cfg.curriculum_type = "complexity_only" 
 
-    if script_cfg.curriculum_type == "level_only" and has_level_info: 
-        curriculum_stages_config_list = [
-            CurriculumStageConfig("basic_only", ["basic"], (0, 10), 0.3, 0.7),
-            CurriculumStageConfig("basic_intermediate", ["basic", "intermediate"], (0, 10), 0.3, 0.65),
-            CurriculumStageConfig("intermediate_advanced", ["intermediate", "advanced"], (0, 10), 0.3, 0.6),
-            CurriculumStageConfig("all_levels", ["basic", "intermediate", "advanced", "expert"], (0, 10), 0.1, 0.5)
-        ]
-        logger.info("📚 Level-only curriculum learning enabled")
+    if script_cfg.curriculum_type == "dual_layer" and has_level_info:
+        logger.info(f"Dynamically generating dual_layer curriculum stages with focus: {script_cfg.curriculum_focus_levels}, emphasis: {script_cfg.curriculum_complexity_emphasis}")
+
+        level_counts_dist = {}
+        complexity_by_level_dist = {}
+        if dataset and len(dataset) > 0:
+            for example in dataset:
+                level = example.get('level', 'unknown').lower()
+                complexity = example.get('complexity_score', 5.0)
+                level_counts_dist[level] = level_counts_dist.get(level, 0) + 1
+                if level not in complexity_by_level_dist:
+                    complexity_by_level_dist[level] = []
+                complexity_by_level_dist[level].append(complexity)
+
+        dataset_distribution_for_stages = {
+            'level_counts': level_counts_dist,
+            'complexity_by_level': complexity_by_level_dist,
+            'total_samples': len(dataset) if dataset else 0
+        }
+
+        curriculum_stages_config_list = create_custom_curriculum_stages(
+            dataset_distribution=dataset_distribution_for_stages,
+            focus_levels=script_cfg.curriculum_focus_levels, # Assumed to be List[str] from HfArgumentParser
+            complexity_emphasis=script_cfg.curriculum_complexity_emphasis
+        )
+        logger.info(f"Generated {len(curriculum_stages_config_list)} custom stages for dual_layer.")
+    else:
+        if script_cfg.curriculum_type != "dual_layer" and has_level_info : # e.g. level_only, but we are simplifying
+            logger.info(f"Curriculum type is '{script_cfg.curriculum_type}'. Using default stages as specific logic for this type (other than dual_layer) is not implemented here, or conditions not met.")
+        elif not has_level_info and script_cfg.curriculum_type != "complexity_only": # User might have set dual_layer/level_only but data is missing
+            logger.info(f"Dataset lacks level information for '{script_cfg.curriculum_type}'. Falling back to default (likely complexity-based) stages.")
         
-    if not curriculum_stages_config_list or script_cfg.curriculum_type == "complexity_only":  
-        curriculum_stages_config_list = [
-            CurriculumStageConfig("simple", ["basic", "intermediate", "advanced", "expert"], (0, 3), 0.3, 0.7, 5, "Simple designs"),
-            CurriculumStageConfig("moderate", ["basic", "intermediate", "advanced", "expert"], (0, 6), 0.4, 0.65, 5, "Moderate complexity"),
-            CurriculumStageConfig("complex", ["basic", "intermediate", "advanced", "expert"], (0, 10), 0.3, 0.6, 4, "Complex designs")
-        ]
-        logger.info("🔢 Complexity-only curriculum learning enabled (or fallback).")
-    
-    if not curriculum_stages_config_list: 
-        logger.error("No curriculum stages defined. Disabling curriculum learning.")
+        curriculum_stages_config_list = create_default_curriculum_stages() # Handles complexity_only or serves as fallback
+        logger.info(f"Generated {len(curriculum_stages_config_list)} default stages (type: {script_cfg.curriculum_type}).")
+
+    if curriculum_stages_config_list:
+        for stage_config_item in curriculum_stages_config_list:
+            if isinstance(stage_config_item, CurriculumStageConfig):
+                stage_config_item.min_evaluations = 10
+            else:
+                logger.warning(f"Encountered non-CurriculumStageConfig item in list: {type(stage_config_item)}")
+        logger.info(f"Ensured min_evaluations is 10 for all {len(curriculum_stages_config_list)} stages.")
+    else:
+        logger.warning("No curriculum stages were generated. Curriculum learning might be ineffective.")
+        return None
+
+    if not curriculum_stages_config_list:
+        logger.error("No curriculum stages defined after attempting generation. Disabling curriculum learning.")
         return None
 
     return EnhancedCurriculumManager(curriculum_stages_config_list, dataset)
@@ -603,7 +633,7 @@ def calculate_enhanced_rewards_for_single_prompt(
         # For per-completion W&B logging (if still desired, now uses unscaled for components)
         if wandb_callback:
             # wandb_callback.log_reward_components(current_unscaled_components) # Log unscaled version
-            wandb_callback.log_reward(final_scaled_reward) # Log final scaled reward for this completion
+            wandb_callback.add_reward(final_scaled_reward) # Changed: Log final scaled reward for this completion for histogram
         
         logger.info(
             f"{log_pref}: Unscaled Rewards - Func:{current_unscaled_components['functional']:.2f} Eff:{current_unscaled_components['efficiency']:.2f} "
@@ -656,174 +686,120 @@ class CurriculumProgressCallback(TrainerCallback):
         if self.curriculum_manager and args.local_rank <= 0:
             # 🔧 修复：安全获取global_step
             current_step = getattr(state, 'global_step', 0) or 0
-            current_stage = self.curriculum_manager.current_stage
+            current_stage_idx = self.curriculum_manager.current_stage # Corrected variable name
             
-            # 获取最近的损失作为性能估计
-            recent_logs = state.log_history[-5:] if len(state.log_history) >= 5 else state.log_history
-            if recent_logs:
-                avg_loss = sum(log.get('loss', 10.0) for log in recent_logs) / len(recent_logs)
-                performance_estimate = max(0, 1.0 - (avg_loss / 10.0))
-                
-                self._write_debug(f"步数: {current_step}")
-                self._write_debug(f"当前阶段: {current_stage}")
-                self._write_debug(f"最近平均损失: {avg_loss:.4f}")
-                self._write_debug(f"性能估计: {performance_estimate:.4f}")
-                
-                # 获取当前阶段配置
-                if current_stage < len(self.curriculum_manager.curriculum_stages):
-                    stage_config = self.curriculum_manager.curriculum_stages[current_stage]
-                    threshold = stage_config.performance_threshold
-                    min_evals = stage_config.min_evaluations
-                    
-                    self._write_debug(f"阶段名称: {stage_config.name}")
-                    self._write_debug(f"性能阈值: {threshold}")
-                    self._write_debug(f"最小评估次数: {min_evals}")
-                    self._write_debug(f"当前评估次数: {len(getattr(self.curriculum_manager, 'stage_performance_history', []))}")
-                    
-                    # 🔧 修复：检查是否应该进阶 - 只传递 performance_estimate
-                    try:
-                        should_advance = self.curriculum_manager.should_advance_stage(performance_estimate)
-                    except TypeError as e:
-                        self._write_debug(f"调用 should_advance_stage 失败: {e}")
-                        should_advance = False
-                    
-                    self._write_debug(f"是否应该进阶: {should_advance}")
-                    
-                    if should_advance:
-                        # 🔧 修复：检查方法名称
-                        advance_success = False
-                        if hasattr(self.curriculum_manager, 'advance_stage'):
-                            advance_success = self.curriculum_manager.advance_stage()
-                        elif hasattr(self.curriculum_manager, 'advance_to_next_stage'):
-                            advance_success = self.curriculum_manager.advance_to_next_stage()
-                        else:
-                            self._write_debug("课程管理器没有 advance_stage 或 advance_to_next_stage 方法")
-                        
-                        if advance_success:
-                            new_stage = self.curriculum_manager.current_stage
-                            new_dataset = self.curriculum_manager.get_current_stage_dataset()
-                            
-                            self._write_debug(f"✅ 成功进阶到阶段 {new_stage}")
-                            self._write_debug(f"新数据集大小: {len(new_dataset)}")
-                            
-                            # 保存阶段进展记录
-                            progress_record = {
-                                "step": current_step,
-                                "old_stage": current_stage,
-                                "new_stage": new_stage,
-                                "performance": performance_estimate,
-                                "dataset_size": len(new_dataset),
-                                "timestamp": datetime.now().isoformat()
-                            }
-                            
-                            progress_file = os.path.join(self.output_dir, "stage_progress.jsonl")
-                            with open(progress_file, 'a') as f:
-                                f.write(json.dumps(progress_record) + "\n")
+            avg_test_pass_rate = 0.0 # Default
+            found_metric = False
+            for log_entry in reversed(state.log_history):
+                if 'eval_avg_test_pass_rate' in log_entry:
+                    avg_test_pass_rate = log_entry['eval_avg_test_pass_rate']
+                    found_metric = True
+                    self._write_debug(f"Found 'eval_avg_test_pass_rate' in log_history: {avg_test_pass_rate:.4f}")
+                    break
 
-                            # W&B Logging for stage transition
-                            if args.local_rank <= 0 and hasattr(wandb, 'run') and wandb.run is not None:
-                                old_stage_idx = current_stage # Stage before advancing
-                                new_stage_idx = new_stage   # Stage after advancing
-                                old_stage_name = "Unknown"
-                                if old_stage_idx < len(self.curriculum_manager.curriculum_stages):
-                                    old_stage_name = self.curriculum_manager.curriculum_stages[old_stage_idx].name
-                                new_stage_name = "Unknown"
-                                if new_stage_idx < len(self.curriculum_manager.curriculum_stages):
-                                    new_stage_name = self.curriculum_manager.curriculum_stages[new_stage_idx].name
+            if not found_metric:
+                self._write_debug("WARN: 'eval_avg_test_pass_rate' not found in log_history. Using default 0.0. Curriculum advancement may be affected.")
 
-                                wandb.log({
-                                    "curriculum/stage_transition": 1,
-                                    "curriculum/old_stage_index": old_stage_idx,
-                                    "curriculum/new_stage_index": new_stage_idx,
-                                    "curriculum/old_stage_name": old_stage_name,
-                                    "curriculum/new_stage_name": new_stage_name,
-                                    "curriculum/current_step": current_step
-                                }, step=current_step)
-                                self._write_debug(f"Logged stage transition to W&B: {old_stage_name} -> {new_stage_name}")
+            performance_estimate = avg_test_pass_rate
 
-                else:
-                    self._write_debug("已达到最终阶段")
-                
-                self._write_debug("-" * 50)
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if not self.curriculum_manager or logs is None:
-            return
+            self._write_debug(f"Step: {current_step}")
+            self._write_debug(f"Current stage index: {current_stage_idx}")
+            self._write_debug(f"Performance estimate (avg_test_pass_rate): {performance_estimate:.4f}")
             
-        # 🔧 修复：安全获取global_step
-        current_step = getattr(state, 'global_step', 0) or 0
-        
-        # 检查是否需要进入下一阶段
-        current_loss = logs.get('train_loss', float('inf'))
-        if hasattr(self.curriculum_manager, 'should_advance_stage'):
-            # 🔧 修复：根据方法签名调用 should_advance_stage
-            try:
-                # 首先尝试只传递 performance_score
-                performance_score = max(0, 1.0 - (current_loss / 10.0)) if current_loss != float('inf') else 0.0
-                should_advance = self.curriculum_manager.should_advance_stage(performance_score)
-            except TypeError:
-                # 如果上面失败，尝试传递两个参数
+            if current_stage_idx < len(self.curriculum_manager.curriculum_stages):
+                stage_config = self.curriculum_manager.curriculum_stages[current_stage_idx]
+                threshold = stage_config.performance_threshold
+                min_evals = stage_config.min_evaluations # This is now 10, but curriculum_manager handles actual counting
+
+                self._write_debug(f"Stage Name: {stage_config.name}")
+                self._write_debug(f"Performance Threshold: {threshold}")
+                self._write_debug(f"Configured Min Evaluations for stage: {min_evals}") # This is the config value
+                self._write_debug(f"Actual evaluations for this stage so far: {len(getattr(self.curriculum_manager, 'stage_performance_history', []))}")
+
                 try:
-                    should_advance = self.curriculum_manager.should_advance_stage(current_loss, current_step)
-                except TypeError:
-                    # 如果都失败，记录错误并跳过
-                    logger.warning(f"无法调用 should_advance_stage 方法，跳过课程学习检查")
+                    # Assuming should_advance_stage in EnhancedCurriculumManager now takes performance_estimate
+                    # and internally handles min_evaluations check using its history.
+                    should_advance = self.curriculum_manager.should_advance_stage(performance_estimate)
+                except TypeError as e:
+                    self._write_debug(f"ERROR calling should_advance_stage: {e}. Check method signature in EnhancedCurriculumManager.")
                     should_advance = False
-            
-            if should_advance:
-                old_stage = self.curriculum_manager.current_stage
-                # 🔧 修复：检查方法名称
-                if hasattr(self.curriculum_manager, 'advance_stage'):
-                    success = self.curriculum_manager.advance_stage()
-                elif hasattr(self.curriculum_manager, 'advance_to_next_stage'):
-                    success = self.curriculum_manager.advance_to_next_stage()
-                else:
-                    logger.warning("课程管理器没有 advance_stage 或 advance_to_next_stage 方法")
-                    success = False
                 
-                if success:
-                    new_stage = self.curriculum_manager.current_stage
-                    
-                    if new_stage != old_stage:
-                        logger.info(f"🎯 课程学习：从阶段 {old_stage} 进入阶段 {new_stage}")
-                        
-                        # 更新训练器的数据集（如果可能）
-                        if self.trainer_ref and hasattr(self.trainer_ref, 'train_dataset'):
-                            try:
-                                new_dataset = self.curriculum_manager.get_current_stage_dataset()
-                                if new_dataset:
-                                    self.trainer_ref.train_dataset = new_dataset
-                                    logger.info(f"✅ 已更新训练数据集，包含 {len(new_dataset)} 个样本")
-                            except Exception as e_update:
-                                logger.warning(f"⚠️ 更新训练数据集失败: {e_update}")
+                self._write_debug(f"Decision: Should advance stage? {should_advance}")
 
-                        # W&B Logging for stage transition (from on_log)
+                if should_advance:
+                    advance_success = False
+                    # Assuming EnhancedCurriculumManager has a method like 'advance_stage' or 'advance_to_next_stage'
+                    if hasattr(self.curriculum_manager, 'advance_stage'):
+                        advance_success = self.curriculum_manager.advance_stage() # This should internally use the stored performance history
+                    elif hasattr(self.curriculum_manager, 'advance_to_next_stage'): # Alternative name
+                        advance_success = self.curriculum_manager.advance_to_next_stage()
+                    else:
+                        self._write_debug("ERROR: Curriculum manager lacks 'advance_stage' or 'advance_to_next_stage' method.")
+                    
+                    if advance_success:
+                        new_stage_idx = self.curriculum_manager.current_stage
+                        new_dataset = self.curriculum_manager.get_current_stage_dataset()
+
+                        self._write_debug(f"✅ Successfully advanced to stage {new_stage_idx}. New dataset size: {len(new_dataset)}")
+
+                        progress_record = {
+                            "step": current_step,
+                            "old_stage_idx": current_stage_idx, # This was before advancing
+                            "new_stage_idx": new_stage_idx,
+                            "performance_metric (avg_test_pass_rate)": performance_estimate,
+                            "new_dataset_size": len(new_dataset),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        
+                        progress_file = os.path.join(self.output_dir, "stage_progress.jsonl")
+                        with open(progress_file, 'a') as f:
+                            f.write(json.dumps(progress_record) + "\n")
+
                         if args.local_rank <= 0 and hasattr(wandb, 'run') and wandb.run is not None:
-                            old_stage_idx = old_stage
-                            new_stage_idx = new_stage
-                            old_stage_name = "Unknown"
-                            if old_stage_idx < len(self.curriculum_manager.curriculum_stages):
-                                old_stage_name = self.curriculum_manager.curriculum_stages[old_stage_idx].name
+                            old_stage_name = stage_config.name # Name of the stage we are leaving
                             new_stage_name = "Unknown"
                             if new_stage_idx < len(self.curriculum_manager.curriculum_stages):
                                 new_stage_name = self.curriculum_manager.curriculum_stages[new_stage_idx].name
 
                             wandb.log({
                                 "curriculum/stage_transition": 1,
-                                "curriculum/old_stage_index": old_stage_idx,
+                                "curriculum/old_stage_index": current_stage_idx, # Index before advancing
                                 "curriculum/new_stage_index": new_stage_idx,
                                 "curriculum/old_stage_name": old_stage_name,
                                 "curriculum/new_stage_name": new_stage_name,
-                                "curriculum/current_step": current_step
+                                "curriculum/performance_metric": performance_estimate
                             }, step=current_step)
-                            logger.info(f"Logged stage transition to W&B (from on_log): {old_stage_name} -> {new_stage_name}")
+                            self._write_debug(f"Logged stage transition to W&B: {old_stage_name} -> {new_stage_name}")
+            else: # current_stage_idx is beyond the defined stages
+                self._write_debug("INFO: All curriculum stages completed or current stage index is out of bounds.")
+
+            self._write_debug("-" * 50) # Separator for logs
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # This on_log part of CurriculumProgressCallback might become less critical for advancement
+        # if on_evaluate is the primary driver. However, it can still log current stage info.
+        if not self.curriculum_manager or logs is None or args.local_rank > 0: # Only log from main process
+            return
+
+        current_step = getattr(state, 'global_step', 0) or 0
         
-        # 记录当前阶段信息
-        if not hasattr(self, 'last_logged_stage') or (hasattr(self, 'last_logged_stage') and self.curriculum_manager.current_stage != self.last_logged_stage):
-            current_stage_obj = self.curriculum_manager.curriculum_stages[self.curriculum_manager.current_stage] if self.curriculum_manager.current_stage < len(self.curriculum_manager.curriculum_stages) else None
-            stage_name = current_stage_obj.name if current_stage_obj else "Final"
-            logger.info(f"📚 当前课程阶段: {self.curriculum_manager.current_stage} ({stage_name})")
-            self.last_logged_stage = self.curriculum_manager.current_stage
+        # Log current stage information periodically or on change
+        current_stage_idx_for_log = self.curriculum_manager.current_stage
+        current_stage_obj_for_log = self.curriculum_manager.curriculum_stages[current_stage_idx_for_log] if current_stage_idx_for_log < len(self.curriculum_manager.curriculum_stages) else None
+        stage_name_for_log = current_stage_obj_for_log.name if current_stage_obj_for_log else f"Final/Completed_idx_{current_stage_idx_for_log}"
+
+        # Log to W&B if it's active
+        if hasattr(wandb, 'run') and wandb.run is not None:
+            wandb.log({
+                "curriculum/current_stage_index": current_stage_idx_for_log,
+                "curriculum/current_stage_name_numeric": current_stage_idx_for_log, # For easier plotting if names are long
+                # "curriculum/current_stage_name_text": stage_name_for_log # W&B might not handle text well for x-axis
+            }, step=current_step)
+
+        # Log to local debug file
+        if not hasattr(self, 'last_logged_stage_idx_on_log') or self.last_logged_stage_idx_on_log != current_stage_idx_for_log or current_step % 50 == 0 : # Log on change or every 50 steps
+            self._write_debug(f"Step {current_step}: Currently in curriculum stage {current_stage_idx_for_log} ('{stage_name_for_log}'). Dataset size: {len(self.curriculum_manager.get_current_stage_dataset())}")
+            self.last_logged_stage_idx_on_log = current_stage_idx_for_log
 
 
 
@@ -1657,15 +1633,22 @@ def main():
                 )
 
             # 调用实际的奖励计算函数
+        # Note: enhanced_batch_reward_calculator itself calls add_reward on the wandb_callback for each item in batch
+        # if wandb_callback is passed into it and used by calculate_enhanced_rewards_for_single_prompt.
+        # So, individual rewards are added there. Here we primarily log aggregated batch metrics.
             rewards_list, aggregated_metrics = enhanced_batch_reward_calculator(*args_reward, **kwargs_reward)
 
             # Log aggregated metrics using wandb_callback if available
+        # The individual rewards for the histogram are added within calculate_enhanced_rewards_for_single_prompt -> wandb_callback.add_reward()
+        # which is called by enhanced_batch_reward_calculator.
+        # Here, we log other batch-level aggregated metrics.
             if 'wandb_callback' in kwargs_reward and kwargs_reward['wandb_callback'] is not None:
                 try:
-                    # Ensure 'training_step' is available for the callback's log method if it needs it directly
-                    # (though usually, on_log in callback gets step from TrainerState)
                     current_step_for_direct_log = kwargs_reward.get('training_step', 0)
-                    kwargs_reward['wandb_callback'].log_batch_aggregated_metrics(aggregated_metrics, step=current_step_for_direct_log)
+                # log_batch_aggregated_metrics is for other types of metrics, not the reward histogram directly.
+                # The reward histogram is built up by add_reward and logged by DetailedWandbCallback.on_log
+                if aggregated_metrics: # Only log if there's something to log
+                     kwargs_reward['wandb_callback'].log_batch_aggregated_metrics(aggregated_metrics, step=current_step_for_direct_log)
                 except Exception as e_cb_log:
                     logger.error(f"Error calling wandb_callback.log_batch_aggregated_metrics: {e_cb_log}", exc_info=True)
 
