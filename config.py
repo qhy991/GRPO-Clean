@@ -68,9 +68,11 @@ class ScriptConfig:
     # --- Fields WITHOUT default values ---
     model_name_or_path: str = field(metadata={"help": "Path to pretrained BASE model or model identifier from huggingface.co/models for GRPO training."})
     dataset_path: str = field(metadata={"help": "Path to the dataset manifest JSONL file."})
-    curriculum_stages: List[Dict[str, Any]] = field(metadata={"help": "Detailed dual-layer curriculum stages configuration."})
 
     # --- Fields WITH default values ---
+    # curriculum_stages is now Optional and has a default, so it belongs in this section.
+    curriculum_stages: Optional[List[Dict[str, Any]]] = field(default=None, metadata={"help": "Detailed dual-layer curriculum stages configuration. Populated dynamically by the script if not provided."})
+    dataset_base_path: Optional[str] = field(default=None, metadata={"help": "Absolute base path for the dataset. If provided, relative paths in the dataset manifest for 'testbench_path' and 'reference_verilog_path' will be resolved against this."})
     stage1_adapter_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the LoRA adapters from the first stage of training. If provided, these will be loaded and training will continue on them."}

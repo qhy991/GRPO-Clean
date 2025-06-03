@@ -466,16 +466,29 @@ class DetailedInferenceCallback(TrainerCallback):
                     
                     try:
                         generated_result = self._generate_single_sample(model, prompt_from_dataset, state.global_step)
+
+                        if generated_result is None: # Safeguard
+                            logger.error(f"Sample {idx} (Task: {sample.get('task_id', 'N/A')}) generation returned None. Skipping.")
+                            generation_results_for_wandb_logging.append({
+                                "step": state.global_step, "sample_idx": idx, "task_id": sample.get('task_id', 'N/A'),
+                                "level": sample.get('level'), "complexity": sample.get('complexity_score'),
+                                "reasoning_preview": "GENERATION_RETURNED_NONE", "code_preview": "", "generation_error": "Returned None"
+                            })
+                            continue
+
+                        if generated_result.get('error'):
+                            logger.warning(f"Sample {idx} (Task: {sample.get('task_id', 'N/A')}) generation error: {generated_result['error']}. Code/reasoning are error messages.")
                         
-                        quality_metrics = assess_code_quality(generated_result.get('code', ''))
+                        quality_metrics = assess_code_quality(generated_result.get('code', '')) # assess_code_quality should handle error strings
                         logger.info(f"生成时间: {generated_result.get('generation_time', 0):.2f}秒, 代码质量: {quality_metrics}")
                         
                         current_sample_wandb_log = {
                             "step": state.global_step, "sample_idx": idx, "task_id": sample.get('task_id', 'N/A'),
                             "level": sample.get('level'), "complexity": sample.get('complexity_score'),
-                            "reasoning_preview": generated_result.get('reasoning', '')[:100],
-                            "code_preview": generated_result.get('code', '')[:100],
-                            **quality_metrics
+                            "reasoning_preview": str(generated_result.get('reasoning', ''))[:100],
+                            "code_preview": str(generated_result.get('code', ''))[:100],
+                            **quality_metrics,
+                            "generation_error": generated_result.get('error')
                         }
 
                         code_to_test = generated_result.get('code')
@@ -562,54 +575,76 @@ class DetailedInferenceCallback(TrainerCallback):
             
     def _generate_single_sample(self, model, prompt, step):
         """生成单个样本"""
-        model.eval()
+        original_training_mode = model.training
+        # Initialize to default error values
+        reasoning, code, raw_output = "INIT_VAL_ERROR", "INIT_VAL_ERROR", "INIT_VAL_ERROR"
+        generation_time = 0
         
-        # 准备输入
-        max_prompt_len = self.max_seq_length - self.max_new_tokens
-        inputs = self.tokenizer(prompt, return_tensors="pt", 
-                               truncation=True, max_length=max_prompt_len).to(model.device)
-        
-        start_time = time.time()
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=0.8,
-                top_p=0.95,
-                repetition_penalty=1.1,
-                pad_token_id=self.tokenizer.pad_token_id
+        try:
+            model.eval()
+
+            max_prompt_len = self.max_seq_length - self.max_new_tokens
+            inputs = self.tokenizer(prompt, return_tensors="pt",
+                                   truncation=True, max_length=max_prompt_len).to(model.device)
+
+            start_time = time.time()
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=0.8, # Consider making these configurable
+                    top_p=0.95,
+                    repetition_penalty=1.1,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+
+            generation_time = time.time() - start_time
+
+            generated_tokens = outputs[0][inputs.input_ids.shape[1]:]
+            raw_output = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+            reasoning, code = parse_llm_completion_with_context(
+                raw_output,
+                prompt=prompt,
+                step=step,
+                sample_idx=0 # Assuming this callback processes one sample at a time for this method
             )
-        
-        generation_time = time.time() - start_time
-        
-        # 解码生成文本
-        generated_tokens = outputs[0][inputs.input_ids.shape[1]:]
-        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
-        # 解析推理和代码
-        reasoning, code = parse_llm_completion_with_context(
-            generated_text,
-            prompt=prompt,  # 传递输入prompt
-            step=step,
-            sample_idx=0  # 单个样本
-        )
-        
-        model.train()  # 恢复训练模式
-        
-        return {
-            'reasoning': reasoning,
-            'code': code,
-            'raw_output': generated_text,
-            'generation_time': generation_time,
-            'step': step,
-            'model_input_prompt': prompt
-        }
-    
+
+            return {
+                'reasoning': reasoning if reasoning is not None else "PARSING_FAILED_REASONING",
+                'code': code if code is not None else "PARSING_FAILED_CODE",
+                'raw_output': raw_output,
+                'generation_time': generation_time,
+                'step': step,
+                'model_input_prompt': prompt,
+                'error': None
+            }
+        except Exception as e:
+            logger.error(f"Error in _generate_single_sample for prompt starting with '{str(prompt)[:100]}...': {e}", exc_info=True)
+            if 'start_time' in locals() and 'generation_time' not in locals(): # Check if start_time was defined
+                 generation_time = time.time() - start_time
+            else:
+                 generation_time = 0 # If error before start_time
+
+            return {
+                'reasoning': "GENERATION_ERROR",
+                'code': f"Error during generation: {str(e)}",
+                'raw_output': f"Exception: {str(e)}",
+                'generation_time': generation_time,
+                'step': step,
+                'model_input_prompt': prompt,
+                'error': str(e)
+            }
+        finally:
+            # Restore model's original training mode
+            model.train(original_training_mode)
+
+
     def _save_generation_sample(self, step, sample_idx, original_sample, generated_result, simulation_result: Optional[Dict[str, Any]] = None):
         """保存生成样本到文件，包含模型实际输入和仿真结果"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         task_id_slug = str(original_sample.get('task_id', f"sample_{sample_idx}")).replace('/', '_')
 
         filename = f"step_{step}_{task_id_slug}_{timestamp}.json"

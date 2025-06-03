@@ -12,51 +12,91 @@ from collections import deque
 import sys  
 import math
 # --- BEGIN: PyTorch Safe Unpickling Configuration ---
-logger_temp = logging.getLogger(__name__ + "_startup") 
+logger_temp = logging.getLogger(__name__ + "_startup")
 try:
-    import numpy 
+    # Ensure numpy is imported as np for the list below
+    # import numpy as np # Should be at the top of the file
+
     from numpy.core.multiarray import _reconstruct
-    from numpy import dtype as numpy_dtype 
-    from numpy.core.numeric import ScalarType as numpy_scalar_types_tuple
-    from numpy.dtypes import UInt32DType # <--- 新增导入
+    from numpy import dtype as numpy_dtype
+    # numpy.ndarray is accessed directly via np.ndarray if numpy is imported as np
+    from numpy.dtypes import UInt32DType
 
     safe_globals_list = []
-    safe_globals_list.append(_reconstruct)
-    safe_globals_list.append(numpy_dtype)
-    safe_globals_list.append(numpy.ndarray)
-    safe_globals_list.append(UInt32DType) # <--- 显式添加
-    
-    # Add numpy.ndarray
-    logger_temp.info("已将 numpy.ndarray 添加到 torch 安全全局变量列表。")
 
-    if isinstance(numpy_scalar_types_tuple, tuple):
-        for individual_scalar_type in numpy_scalar_types_tuple:
-            if isinstance(individual_scalar_type, type): # Ensure it's a type object
-                 safe_globals_list.append(individual_scalar_type)
-            else:
-                 logger_temp.warning(f"从 numpy_scalar_types_tuple 跳过非类型元素: {individual_scalar_type} (类型: {type(individual_scalar_type)})")
-        logger_temp.info(f"从 numpy.core.numeric.ScalarType (元组) 中单独添加了 {len([s for s in numpy_scalar_types_tuple if isinstance(s, type)])} 个标量类型到安全列表。")
-    elif isinstance(numpy_scalar_types_tuple, type): # Fallback if it's a single type
-        safe_globals_list.append(numpy_scalar_types_tuple)
-        logger_temp.warning("numpy.core.numeric.ScalarType 不是预期的元组类型，已直接添加。")
+    # Add core numpy elements known to be safe
+    if callable(_reconstruct):
+        safe_globals_list.append(_reconstruct)
     else:
-        logger_temp.warning(f"numpy.core.numeric.ScalarType ('numpy_scalar_types_tuple') 既不是元组也不是类型: {type(numpy_scalar_types_tuple)}。可能未正确添加到安全列表。")
+        logger_temp.warning("_reconstruct is not callable.")
+
+    if isinstance(numpy_dtype, type):
+        safe_globals_list.append(numpy_dtype)
+    else:
+        logger_temp.warning("numpy.dtype is not a type.")
+
+    if isinstance(np.ndarray, type): # Assuming import numpy as np
+        safe_globals_list.append(np.ndarray)
+    else:
+        logger_temp.warning("np.ndarray is not a type.")
+
+    if isinstance(UInt32DType, type):
+        safe_globals_list.append(UInt32DType)
+    else:
+        logger_temp.warning("UInt32DType is not a type.")
+
+    logger_temp.info(f"Initial safe_globals_list before adding scalar types: {len(safe_globals_list)} items.")
+
+    # Add common numpy scalar types explicitly
+    numpy_scalar_types_to_add = [
+        np.bool_, np.byte, np.ubyte, np.short, np.ushort, np.intc, np.uintc,
+        np.int_, np.uint, np.longlong, np.ulonglong,
+        np.half, np.float16, np.single, np.double, np.longdouble,
+        np.csingle, np.cdouble, np.clongdouble,
+        np.int8, np.int16, np.int32, np.int64,
+        np.uint8, np.uint16, np.uint32, np.uint64,
+        np.float32, np.float64
+    ]
+
+    added_scalar_types_count = 0
+    for nt_class in numpy_scalar_types_to_add:
+        if isinstance(nt_class, type):
+            safe_globals_list.append(nt_class)
+            added_scalar_types_count += 1
+        else:
+            # Attempt to get the type if nt_class is an instance (e.g. np.float32 is an instance of numpy.dtype)
+            # However, numpy scalar types like np.float32 are themselves types (e.g. type(np.float32) is numpy.dtype)
+            # The list numpy_scalar_types_to_add should ideally contain the type objects directly.
+            # For example, np.float32 is <class 'numpy.float32'>.
+            # Let's assume the elements in numpy_scalar_types_to_add are already the type objects.
+            logger_temp.warning(f"NumPy scalar '{str(nt_class)}' (type: {type(nt_class)}) is not directly a type class, not adding.")
+
+    logger_temp.info(f"Added {added_scalar_types_count} NumPy scalar types to safe_globals_list.")
+
+    # Log the list before adding to torch to help debug if error persists
+    # for idx, item in enumerate(safe_globals_list):
+    #    logger_temp.debug(f"Item {idx} in safe_globals_list: {str(item)} (Type: {type(item)})")
+
+    if not safe_globals_list:
+        logger_temp.warning("safe_globals_list is empty before calling torch.serialization.add_safe_globals.")
 
     torch.serialization.add_safe_globals(safe_globals_list)
     logger_temp.info(
-        f"已更新 torch 安全全局变量列表。当前内容: {[str(g) for g in safe_globals_list]}"
+        f"Successfully updated torch safe global variables list with {len(safe_globals_list)} items."
     )
+    # logger_temp.debug(f"Current safe globals content: {[str(g) for g in safe_globals_list]}") # Could be very long
+
 except ImportError as e:
     logger_temp.warning(
-        f"未能导入 numpy 的某些模块以添加到 torch 安全全局变量: {e}。"
-        "如果遇到 RNG 或优化器状态加载问题，这可能是原因。"
+        f"Failed to import NumPy modules for torch safe globals: {e}. "
+        "If you encounter RNG or optimizer state loading issues, this might be the cause."
     )
-except AttributeError as e: 
+except AttributeError as e:
     logger_temp.warning(
-        f"访问 numpy 的某些属性以添加到 torch 安全全局变量时出错: {e}。"
+        f"Attribute error accessing NumPy properties for torch safe globals: {e}."
     )
-except Exception as e_globals: 
-    logger_temp.error(f"设置 torch 安全全局变量时发生未知错误: {e_globals}", exc_info=True)
+except Exception as e_globals:
+    logger_temp.error(f"An unexpected error occurred while setting up torch safe globals: {e_globals}", exc_info=True)
 # --- END: PyTorch Safe Unpickling Configuration ---
 
 from datasets import load_dataset, Dataset
@@ -1187,8 +1227,17 @@ def main():
         logger.info(f"Finalized generation config: {model.generation_config.to_dict()}")
 
         try:
-            dataset_dir = os.path.dirname(os.path.abspath(script_cfg.dataset_path))
-            logger.info(f"Dataset directory: {dataset_dir}")
+            # Determine effective base path for dataset files
+            effective_dataset_base_path = script_cfg.dataset_base_path
+            if effective_dataset_base_path is None or not str(effective_dataset_base_path).strip():
+                effective_dataset_base_path = os.path.dirname(os.path.abspath(script_cfg.dataset_path))
+                logger.info(f"dataset_base_path not provided or empty, derived base path from dataset_path: {effective_dataset_base_path}")
+            else:
+                effective_dataset_base_path = os.path.abspath(effective_dataset_base_path) # Ensure it's absolute
+                logger.info(f"Using dataset_base_path from args: {effective_dataset_base_path}")
+
+            # dataset_dir = os.path.dirname(os.path.abspath(script_cfg.dataset_path)) # Old logic
+            # logger.info(f"Dataset directory: {dataset_dir}") # Old log
             
             dataset_raw = load_dataset("json", data_files=script_cfg.dataset_path, split="train", cache_dir=script_cfg.cache_dir)
             logger.info(f"Raw dataset loaded: {len(dataset_raw)} rows. Columns: {dataset_raw.column_names}")
@@ -1306,7 +1355,8 @@ def main():
                 return final_ds
 
             dataset = full_dataset_processing_pipeline(
-                dataset_raw, dataset_dir, 
+                dataset_raw,
+                effective_dataset_base_path, # Use the new variable
                 max(1, os.cpu_count() // 2 if os.cpu_count() else 1), 
                 getattr(grpo_cfg, 'overwrite_cache', False),
                 grpo_cfg.local_rank,
