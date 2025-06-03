@@ -65,11 +65,12 @@ class ScriptConfig:
     """
     Configuration for the training script execution, paths, and non-GRPO model/data parameters.
     """
-    # --- Non-default arguments first ---
+    # --- Fields WITHOUT default values ---
     model_name_or_path: str = field(metadata={"help": "Path to pretrained BASE model or model identifier from huggingface.co/models for GRPO training."})
     dataset_path: str = field(metadata={"help": "Path to the dataset manifest JSONL file."})
+    curriculum_stages: List[Dict[str, Any]] = field(metadata={"help": "Detailed dual-layer curriculum stages configuration."})
 
-    # --- Arguments with default values ---
+    # --- Fields WITH default values ---
     stage1_adapter_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the LoRA adapters from the first stage of training. If provided, these will be loaded and training will continue on them."}
@@ -114,9 +115,6 @@ class ScriptConfig:
         default="balanced", 
         metadata={"help": "Complexity emphasis: 'simple', 'balanced', 'complex'"}
     )
-    
-    # Dual-layer curriculum stages (more fine-grained control)
-    curriculum_stages: List[Dict[str, Any]] = field(metadata={"help": "Detailed dual-layer curriculum stages configuration."})
     
     # Experience replay config
     enable_experience_replay: bool = field(default=True, metadata={"help": "Enable experience replay buffer."})

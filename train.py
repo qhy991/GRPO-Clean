@@ -750,7 +750,7 @@ class CurriculumProgressCallback(TrainerCallback):
                             "new_dataset_size": len(new_dataset),
                             "timestamp": datetime.now().isoformat()
                         }
-                        
+
                         progress_file = os.path.join(self.output_dir, "stage_progress.jsonl")
                         with open(progress_file, 'a') as f:
                             f.write(json.dumps(progress_record) + "\n")
@@ -775,31 +775,59 @@ class CurriculumProgressCallback(TrainerCallback):
 
             self._write_debug("-" * 50) # Separator for logs
 
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        # This on_log part of CurriculumProgressCallback might become less critical for advancement
-        # if on_evaluate is the primary driver. However, it can still log current stage info.
-        if not self.curriculum_manager or logs is None or args.local_rank > 0: # Only log from main process
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs: Optional[Dict[str, float]] = None, **kwargs):
+        if not self.curriculum_manager or args.local_rank > 0: # ensure manager exists and only on main process
             return
 
         current_step = getattr(state, 'global_step', 0) or 0
-        
-        # Log current stage information periodically or on change
-        current_stage_idx_for_log = self.curriculum_manager.current_stage
-        current_stage_obj_for_log = self.curriculum_manager.curriculum_stages[current_stage_idx_for_log] if current_stage_idx_for_log < len(self.curriculum_manager.curriculum_stages) else None
-        stage_name_for_log = current_stage_obj_for_log.name if current_stage_obj_for_log else f"Final/Completed_idx_{current_stage_idx_for_log}"
 
-        # Log to W&B if it's active
+        # Regular W&B logging for current curriculum status
         if hasattr(wandb, 'run') and wandb.run is not None:
-            wandb.log({
-                "curriculum/current_stage_index": current_stage_idx_for_log,
-                "curriculum/current_stage_name_numeric": current_stage_idx_for_log, # For easier plotting if names are long
-                # "curriculum/current_stage_name_text": stage_name_for_log # W&B might not handle text well for x-axis
-            }, step=current_step)
+            current_stage_idx = self.curriculum_manager.current_stage
+            stage_name = "Unknown/Completed"
+            num_samples_in_stage = 0
+            current_stage_performance_threshold = 0.0
 
-        # Log to local debug file
-        if not hasattr(self, 'last_logged_stage_idx_on_log') or self.last_logged_stage_idx_on_log != current_stage_idx_for_log or current_step % 50 == 0 : # Log on change or every 50 steps
-            self._write_debug(f"Step {current_step}: Currently in curriculum stage {current_stage_idx_for_log} ('{stage_name_for_log}'). Dataset size: {len(self.curriculum_manager.get_current_stage_dataset())}")
-            self.last_logged_stage_idx_on_log = current_stage_idx_for_log
+            if current_stage_idx < len(self.curriculum_manager.curriculum_stages):
+                current_stage_obj = self.curriculum_manager.curriculum_stages[current_stage_idx]
+                stage_name = current_stage_obj.name
+                current_stage_performance_threshold = current_stage_obj.performance_threshold
+                try:
+                    # This might be expensive. If so, curriculum_manager should cache dataset size per stage.
+                    current_dataset = self.curriculum_manager.get_current_stage_dataset()
+                    num_samples_in_stage = len(current_dataset) if current_dataset else 0
+                except Exception as e_ds_len:
+                    logger.warning(f"CurriculumProgressCallback: Could not get current stage dataset size for logging: {e_ds_len}")
+
+            # Get the latest performance estimate if available (e.g. from eval_avg_test_pass_rate logged by DetailedInferenceCallback)
+            latest_perf_estimate = 0.0
+            # Check if 'eval_avg_test_pass_rate' is in the logs passed to this on_log method (e.g. from trainer state after eval)
+            if logs and 'eval_avg_test_pass_rate' in logs:
+                 latest_perf_estimate = logs['eval_avg_test_pass_rate']
+            elif state.log_history: # Fallback to searching history if not in current logs
+                for log_entry in reversed(state.log_history):
+                    if 'eval_avg_test_pass_rate' in log_entry:
+                        latest_perf_estimate = log_entry['eval_avg_test_pass_rate']
+                        break
+
+            wandb.log({
+                "curriculum/current_stage_idx": current_stage_idx,
+                "curriculum/current_stage_name_numeric": current_stage_idx, # Using index for easier plotting over name
+                "curriculum/num_samples_in_stage": num_samples_in_stage,
+                "curriculum/current_stage_perf_threshold": current_stage_performance_threshold,
+                "curriculum/latest_eval_avg_test_pass_rate": latest_perf_estimate
+            }, step=state.global_step)
+
+        # Original local file logging for when stage actually changes
+        # Renamed attribute to avoid potential conflicts and make it clear it's for local logging
+        if not hasattr(self, 'last_locally_logged_stage_idx') or self.last_locally_logged_stage_idx != self.curriculum_manager.current_stage or current_step % 50 == 0:
+            current_stage_idx_for_local_log = self.curriculum_manager.current_stage
+            stage_name_for_local_log = "Unknown/Completed"
+            if current_stage_idx_for_local_log < len(self.curriculum_manager.curriculum_stages):
+                 stage_name_for_local_log = self.curriculum_manager.curriculum_stages[current_stage_idx_for_local_log].name
+
+            self._write_debug(f"Step {current_step}: Currently in curriculum stage {current_stage_idx_for_local_log} ('{stage_name_for_local_log}'). Dataset size: {len(self.curriculum_manager.get_current_stage_dataset())}")
+            self.last_locally_logged_stage_idx = current_stage_idx_for_local_log
 
 
 
