@@ -602,8 +602,8 @@ def calculate_enhanced_rewards_for_single_prompt(
         
         # For per-completion W&B logging (if still desired, now uses unscaled for components)
         if wandb_callback:
-            # wandb_callback.log_reward_components(current_unscaled_components) # Log unscaled version
-            wandb_callback.log_reward(final_scaled_reward) # Log final scaled reward for this completion
+            wandb_callback.log_reward_components(current_unscaled_components) # Log unscaled version
+            wandb_callback.add_reward(final_scaled_reward) # Changed: Log final scaled reward for this completion for histogram
         
         logger.info(
             f"{log_pref}: Unscaled Rewards - Func:{current_unscaled_components['functional']:.2f} Eff:{current_unscaled_components['efficiency']:.2f} "
@@ -1389,7 +1389,8 @@ def main():
                 max_new_tokens=grpo_cfg.max_completion_length,
                 max_seq_length=script_cfg.max_seq_length,
                 experience_buffer=experience_buffer,
-                output_dir=script_cfg.output_dir
+                output_dir=script_cfg.output_dir,
+                curriculum_manager=curriculum_manager # <-- ADD THIS ARGUMENT
             )
             callbacks_list.append(detailed_inference_cb)
             logger.info(f"EnhancedInferenceCallback initialized with {len(sample_dataset_for_inf_cb)} samples.")

@@ -16,6 +16,9 @@ import wandb
 from dataclasses import asdict
 import time
 import datetime
+from typing import Optional # Added Optional
+from enhanced_curriculum import EnhancedCurriculumManager # Added EnhancedCurriculumManager
+
 # --- Constants for Verilog Parsing ---
 THINK_START = "<think>"
 THINK_END = "</think>"
@@ -420,10 +423,11 @@ class EnhancedInferenceCallback(TrainerCallback):
 # 2. 增强的推理回调，输出生成样本
 class DetailedInferenceCallback(TrainerCallback):
     def __init__(self, tokenizer, eval_dataset, num_samples=2, eval_every_n_steps=25, 
-                 max_new_tokens=512, max_seq_length=2048, experience_buffer=None, output_dir=None):
+                 max_new_tokens=512, max_seq_length=2048, experience_buffer=None, output_dir=None,
+                 curriculum_manager: Optional[EnhancedCurriculumManager] = None): # Added curriculum_manager
         super().__init__()
         self.tokenizer = tokenizer
-        self.eval_dataset = eval_dataset
+        self.eval_dataset = eval_dataset # Fallback
         self.num_samples = num_samples
         self.eval_every_n_steps = eval_every_n_steps
         self.max_new_tokens = max_new_tokens
@@ -431,6 +435,7 @@ class DetailedInferenceCallback(TrainerCallback):
         self.experience_buffer = experience_buffer
         self.generation_history = []
         self.output_dir = output_dir
+        self.curriculum_manager = curriculum_manager # Store curriculum_manager
         
         # 创建生成样本保存目录
         if self.output_dir:
@@ -444,15 +449,49 @@ class DetailedInferenceCallback(TrainerCallback):
 
             logger.info(f"\n🔍 === 推理回调 (DetailedInferenceCallback) - 步数 {state.global_step} ===")
             
-            if self.eval_dataset and len(self.eval_dataset) > 0:
-                sample_indices = random.sample(range(len(self.eval_dataset)), 
-                                               min(self.num_samples, len(self.eval_dataset)))
+            eval_dataset_to_use = self.eval_dataset # Fallback to the original dataset
+
+            if self.curriculum_manager and hasattr(self.curriculum_manager, 'is_enabled') and self.curriculum_manager.is_enabled():
+                current_stage_dataset = self.curriculum_manager.get_current_stage_dataset()
+                if current_stage_dataset and len(current_stage_dataset) > 0:
+                    eval_dataset_to_use = current_stage_dataset
+                    logger.info(f"DetailedInferenceCallback: Using curriculum stage dataset with {len(eval_dataset_to_use)} samples.")
+                else:
+                    logger.warning("DetailedInferenceCallback: Curriculum manager enabled, but current stage dataset is empty or None. Using fallback eval_dataset.")
+            elif self.curriculum_manager: # Curriculum manager exists but might not be 'enabled' via a specific flag
+                current_stage_dataset = self.curriculum_manager.get_current_stage_dataset()
+                if current_stage_dataset and len(current_stage_dataset) > 0:
+                    eval_dataset_to_use = current_stage_dataset
+                    logger.info(f"DetailedInferenceCallback: Using curriculum stage dataset with {len(eval_dataset_to_use)} samples (no explicit is_enabled check or passed).")
+                else:
+                    logger.warning("DetailedInferenceCallback: Curriculum manager present, but current stage dataset is empty or None. Using fallback eval_dataset.")
+
+            if not eval_dataset_to_use or len(eval_dataset_to_use) == 0:
+                logger.warning("DetailedInferenceCallback: No valid dataset available for evaluation. Skipping.")
+                return
+
+            # Determine the number of samples to select from eval_dataset_to_use
+            num_samples_to_take = min(self.num_samples, len(eval_dataset_to_use))
+
+            if num_samples_to_take > 0:
+                sample_indices = random.sample(range(len(eval_dataset_to_use)), num_samples_to_take)
+            else:
+                logger.warning("DetailedInferenceCallback: Not enough samples to take for evaluation. Skipping.")
+                return
+
+            # The original code iterated through sample_indices and used self.eval_dataset[idx]
+            # Now it should use eval_dataset_to_use[idx]
+            # The rest of the loop structure can remain similar
+
+            # if self.eval_dataset and len(self.eval_dataset) > 0: # This check is now handled by eval_dataset_to_use
+            #     sample_indices = random.sample(range(len(self.eval_dataset)),
+            #                                    min(self.num_samples, len(self.eval_dataset)))
                 
-                for i, idx in enumerate(sample_indices):
-                    sample = self.eval_dataset[idx]
+            for i, idx in enumerate(sample_indices):
+                sample = eval_dataset_to_use[idx] # Use eval_dataset_to_use
                     
-                    # 假设: sample['prompt'] 已经是 Qwen 格式化的
-                    # 这是因为 eval_dataset 应该是由主训练脚本的 full_dataset_processing_pipeline 处理过的
+                # 假设: sample['prompt'] 已经是 Qwen 格式化的
+                # 这是因为 eval_dataset 应该是由主训练脚本的 full_dataset_processing_pipeline 处理过的
                     prompt_from_dataset = sample['prompt'] 
                     
                     logger.info(f"\n📝 样本 {i+1}/{len(sample_indices)} (数据集索引: {idx})")

@@ -202,10 +202,10 @@ class EnhancedRewardConfig:
     """
     # Basic compilation rewards
     compilation_success: float = field(default=2.0, metadata={"help": "Base reward for successful compilation. Increased from 1.0."})
-    compilation_failure: float = field(default=-8.0, metadata={"help": "Penalty for compilation failure. Increased magnitude."})
+    compilation_failure: float = field(default=-4.0, metadata={"help": "Penalty for compilation failure. Increased magnitude."})
     simulation_crash: float = field(default=-4.0, metadata={"help": "Penalty for simulation crash. Increased magnitude."})
     output_parse_error: float = field(default=-2.0, metadata={"help": "Penalty for output parsing error."})
-    missing_code_block_penalty: float = field(default=-6.0, metadata={"help": "Penalty if the generated code block is missing."})
+    missing_code_block_penalty: float = field(default=-3.0, metadata={"help": "Penalty if the generated code block is missing."})
     
     # Enhanced functional correctness rewards (non-linear)
     test_pass_base_reward: float = field(default=1.5, metadata={"help": "Base reward per passed test case."})
@@ -233,7 +233,7 @@ class EnhancedRewardConfig:
     robustness_weight: float = field(default=0.1, metadata={"help": "Weight for code robustness in total reward."})
     
     # Dynamic reward scaling
-    enable_adaptive_scaling: bool = field(default=True, metadata={"help": "Enable adaptive reward scaling based on training progress."})
+    enable_adaptive_scaling: bool = field(default=False, metadata={"help": "Enable adaptive reward scaling based on training progress."})
     reward_scale_factor: float = field(default=1.0, metadata={"help": "Global reward scale factor for fine-tuning."})
     reward_clipping_range: float = field(default=20.0, metadata={"help": "Clip rewards to [-range, +range] to prevent instability."})
     
