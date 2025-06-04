@@ -101,6 +101,7 @@ class DetailedWandbCallback(TrainerCallback):
         self.reward_cfg = reward_cfg
         self.experience_buffer = experience_buffer
         self.step_count = 0
+        self.recent_rewards = deque(maxlen=100) # Added initialization
         
     def on_init_end(self, args, state, control, **kwargs):
         if not getattr(self.env_cfg, 'wandb_disable', False):
@@ -157,6 +158,11 @@ class DetailedWandbCallback(TrainerCallback):
                 wandb.log({f"reward_components/{k}": v for k, v in reward_components.items()})
         except Exception as e:
             logger.warning(f"Failed to log reward components: {e}")
+
+    def add_reward(self, reward: float):
+        if getattr(self.env_cfg, 'wandb_disable', False) or (hasattr(wandb, 'run') and wandb.run is None):
+            return
+        self.recent_rewards.append(reward)
 
     def log_reward(self, reward: float):
         """Log individual reward values."""
